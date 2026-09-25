@@ -474,6 +474,56 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
+# Eager ragged C4 indexer (SGLANG_DSV4_INDEXER_EAGER_RAGGED=1): under the breakable
+# prefill graph, the C4 indexer logits + top-k for the real rows run inside the
+# attention eager break (the graph segment already ends right before attention), so
+# the padded-row indexer work leaves the captured segment and prefill rows use the
+# non-paged DeepGEMM kernel. The indexer compressor (K cache write) stays captured.
+# layer_id -> C4Indexer for the eager break; each layer overwrites its entry every step.
+_EAGER_C4_INDEXERS: dict = {}
+
+
+def _eager_indexer_active(attn_backend, indexer, forward_batch) -> bool:
+    return (
+        indexer is not None
+        and is_in_breakable_cuda_graph()
+        and forward_batch.forward_mode.is_extend()
+        and hasattr(attn_backend, "eager_ragged_indexer_supported")
+        and attn_backend.eager_ragged_indexer_supported(indexer, forward_batch)
+    )
+
+
+def deepseek_v4_eager_indexer_attention_with_output(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    output: torch.Tensor,
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    layer_id: int,
+    compress_ratio: int,
+    attn_sink: torch.Tensor,
+    save_kv_cache: bool,
+) -> None:
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attn_backend = get_attn_backend()
+    attn_backend.forward_c4_indexer_eager(
+        x=x,
+        q_lora=q_lora,
+        c4_indexer=_EAGER_C4_INDEXERS[layer_id],
+        forward_batch=forward_batch,
+    )
+    deepseek_v4_attention_with_output(
+        query, key_value, output, layer_id, compress_ratio, attn_sink, save_kv_cache
+    )
+    return
+
+
+bcg_deepseek_v4_eager_indexer_attention_with_output = eager_on_graph(True)(
+    deepseek_v4_eager_indexer_attention_with_output
+)
+
+
 class MqaAttentionBase(nn.Module):
 
     def __init__(
@@ -761,6 +811,8 @@ class MQALayer(MqaAttentionBase):
 
         self.compressor = None
         self.indexer = None
+        # Set by the forward when the C4 indexer runs eagerly inside attention.
+        self._eager_indexer_q_lora = None
         if self.compress_ratio in (4, 128):
             self.compressor = Compressor(
                 config,
@@ -937,16 +989,27 @@ class MQALayer(MqaAttentionBase):
         q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
+        self._eager_indexer_q_lora = None
         if self.indexer is not None:
             with torch.cuda.stream(stream_indexer):
-                self.indexer(
-                    x=x,
-                    q_lora=q_lora,
-                    forward_batch=forward_batch,
-                    attn_backend=attn_backend,
-                    enable_multi_stream=True,
-                    q_lora_ready=q_lora_ready,
-                )
+                if _eager_indexer_active(attn_backend, self.indexer, forward_batch):
+                    _EAGER_C4_INDEXERS[self.attn_mqa.layer_id] = self.indexer
+                    self._eager_indexer_q_lora = q_lora
+                    attn_backend.forward_indexer_compressor(
+                        x=x,
+                        forward_batch=forward_batch,
+                        layer_id=self.indexer.layer_id,
+                        compressor=self.indexer.compressor,
+                    )
+                else:
+                    self.indexer(
+                        x=x,
+                        q_lora=q_lora,
+                        forward_batch=forward_batch,
+                        attn_backend=attn_backend,
+                        enable_multi_stream=True,
+                        q_lora_ready=q_lora_ready,
+                    )
 
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
@@ -1053,13 +1116,24 @@ class MQALayer(MqaAttentionBase):
         del qkv_a
 
         # Indexer + compressor: serial on current.
+        self._eager_indexer_q_lora = None
         if self.indexer is not None:
-            self.indexer(
-                x=x,
-                q_lora=q_lora,
-                forward_batch=forward_batch,
-                attn_backend=attn_backend,
-            )
+            if _eager_indexer_active(attn_backend, self.indexer, forward_batch):
+                _EAGER_C4_INDEXERS[self.attn_mqa.layer_id] = self.indexer
+                self._eager_indexer_q_lora = q_lora
+                attn_backend.forward_indexer_compressor(
+                    x=x,
+                    forward_batch=forward_batch,
+                    layer_id=self.indexer.layer_id,
+                    compressor=self.indexer.compressor,
+                )
+            else:
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                )
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,
@@ -1375,13 +1449,24 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
+        self._eager_indexer_q_lora = None
         if self.indexer is not None:
-            self.indexer(
-                x=x,
-                q_lora=q_lora,
-                forward_batch=forward_batch,
-                attn_backend=attn_backend,
-            )
+            if _eager_indexer_active(attn_backend, self.indexer, forward_batch):
+                _EAGER_C4_INDEXERS[self.attn_mqa.layer_id] = self.indexer
+                self._eager_indexer_q_lora = q_lora
+                attn_backend.forward_indexer_compressor(
+                    x=x,
+                    forward_batch=forward_batch,
+                    layer_id=self.indexer.layer_id,
+                    compressor=self.indexer.compressor,
+                )
+            else:
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                )
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,
@@ -1517,15 +1602,30 @@ class MQALayer(MqaAttentionBase):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
-                bcg_deepseek_v4_attention_with_output(
-                    attn_q,
-                    attn_k,
-                    o,
-                    self.attn_mqa.layer_id,
-                    self.compress_ratio,
-                    attn_sink,
-                    save_kv_cache,
-                )
+                eager_indexer_q_lora = self._eager_indexer_q_lora
+                if eager_indexer_q_lora is not None:
+                    self._eager_indexer_q_lora = None
+                    bcg_deepseek_v4_eager_indexer_attention_with_output(
+                        attn_q,
+                        attn_k,
+                        o,
+                        x,
+                        eager_indexer_q_lora,
+                        self.attn_mqa.layer_id,
+                        self.compress_ratio,
+                        attn_sink,
+                        save_kv_cache,
+                    )
+                else:
+                    bcg_deepseek_v4_attention_with_output(
+                        attn_q,
+                        attn_k,
+                        o,
+                        self.attn_mqa.layer_id,
+                        self.compress_ratio,
+                        attn_sink,
+                        save_kv_cache,
+                    )
             else:
                 o = attn_backend.forward(
                     q=attn_q,

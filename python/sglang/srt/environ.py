@@ -917,6 +917,10 @@ class Envs:
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+    # DeepSeek-V4 C4 indexer: compute logits and top-k for all prefill rows of a step
+    # with one ragged non-paged launch per layer (v2 top-k), outside the captured
+    # segment; verify rows keep the paged kernel. Opt-in.
+    SGLANG_DSV4_INDEXER_EAGER_RAGGED = EnvBool(False)
 
     # ===================================================================
     # Triton and Torch compilation

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    plan_topk_v2,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -401,7 +402,311 @@ def topk_transform_512_flashinfer_unfused(
     )
 
 
-class C4IndexerBackendMixin:
+# Eager ragged C4 indexer (SGLANG_DSV4_INDEXER_EAGER_RAGGED=1). Under the breakable
+# prefill graph, the indexer logits + top-k for the real rows of an EXTEND/MIXED step
+# run inside the attention eager break instead of on every padded row inside the
+# captured segment. All prefill sequences of the step share one ragged non-paged
+# launch: their gathered K is concatenated (one batched gather), each row's DeepGEMM
+# range is [off_s, off_s + c4len) and the kernel stores compressed logits (column 0 =
+# ks[row]), so one `deep_gemm.fp8_mqa_logits` + one v2 top-k launch cover every
+# prefill row. The verify rows [mixed_t, real) keep the paged kernel over their real
+# rows only. The indexer compressor (K cache write) stays captured. Unfilled logits
+# columns are not masked: the top-k never reads past each row's length.
+
+
+class RaggedIndexerPlan:
+    """One ragged non-paged launch for rows [0, rows) of the step."""
+
+    __slots__ = (
+        "rows",  # int: prefill rows covered (a contiguous prefix of the chunk)
+        "gather_lens",  # int32 [n_seq] device: c4len gathered per sequence
+        "gather_pages",  # int32 [n_seq, max_pages] device: one page-table row per sequence
+        "seq_len_sum",  # int: total gathered K rows
+        "max_seq_len",  # int: max gathered c4len
+        "ks",
+        "ke",  # int32 [rows] device: DeepGEMM ranges (empty when c4len <= topk)
+        "lens",  # int32 [rows] device: per-row c4len (top-k seq_lens)
+        "max_seqlen_k",  # int: logits width (max c4len rounded to the c4 page)
+        "topk_meta",  # v2 top-k plan over lens
+    )
+
+
+class PagedIndexerRange:
+    __slots__ = ("a", "b", "meta")
+
+
+class RaggedIndexerStepPlan:
+    __slots__ = ("real", "mixed_t", "ragged", "paged", "paged_ranges")
+
+
+def build_ragged_indexer_plan(
+    *,
+    ext_lens,  # per-sequence extend rows (list[int]), sequences ordered as their rows
+    seq_lens,  # per-sequence total seq_len (list[int])
+    c4_seq_lens_all,  # int tensor [rows(, 1)] device: per-row c4 length
+    page_table_all,  # int32 [rows, max_pages] device
+    max_c4_seq_len: int,
+    c4_page_size: int,
+    topk: int,
+    mixed_t: int,
+    real: int,
+) -> RaggedIndexerStepPlan:
+    """Pure plan builder (testable without a ForwardBatch)."""
+    plan = RaggedIndexerStepPlan()
+    plan.real = real
+    plan.mixed_t = mixed_t
+    plan.ragged = None
+    plan.paged = []
+    c4_all = c4_seq_lens_all.reshape(-1)
+    seq_rows, seq_c4, start = [], [], 0
+    covered = 0
+    for s, n in enumerate(ext_lens):
+        n = int(n)
+        a, b = start, start + n
+        start = b
+        if n <= 0:
+            continue
+        # Bound the gathered-K allocation by the page-table width (what the paged
+        # path is bounded by too): a capture-time dummy batch may carry an
+        # arbitrary seq_len fill value.
+        final_c4 = min(int(seq_lens[s]) // 4, int(max_c4_seq_len))
+        if final_c4 <= 0 or a != covered or b > mixed_t:
+            break  # keep the ragged set a contiguous prefix; the rest goes paged
+        seq_rows.append((a, b))
+        seq_c4.append(final_c4)
+        covered = b
+    if seq_rows:
+        dev = c4_all.device
+        rg = RaggedIndexerPlan()
+        rg.rows = covered
+        lens = c4_all[:covered].to(torch.int32)
+        # per-row bound: never read beyond what is gathered for the row's sequence
+        bound = torch.empty(covered, dtype=torch.int32, device=dev)
+        offs = torch.empty(covered, dtype=torch.int32, device=dev)
+        off = 0
+        for (a, b), c4 in zip(seq_rows, seq_c4):
+            bound[a:b] = c4
+            offs[a:b] = off
+            off += c4
+        lens = torch.minimum(lens, bound).clamp_(min=0)
+        rg.lens = lens.contiguous()
+        rg.gather_lens = torch.tensor(seq_c4, dtype=torch.int32, device=dev)
+        rg.gather_pages = (
+            page_table_all[[a for a, _ in seq_rows]].to(torch.int32).contiguous()
+        )
+        rg.seq_len_sum = off
+        rg.max_seq_len = max(seq_c4)
+        # SGL top-k synthesizes sequential indices for rows with <= topk
+        # candidates without reading logits: give DeepGEMM an empty range.
+        nontrivial = lens > topk
+        rg.ks = offs.contiguous()
+        rg.ke = torch.where(nontrivial, offs + lens, offs).contiguous()
+        rg.max_seqlen_k = (
+            (max(seq_c4) + c4_page_size - 1) // c4_page_size * c4_page_size
+        )
+        rg.topk_meta = plan_topk_v2(rg.lens)
+        plan.ragged = rg
+    paged_ranges = []
+    if covered < mixed_t:
+        paged_ranges.append((covered, mixed_t))
+    if real > mixed_t:
+        paged_ranges.append((mixed_t, real))
+    plan.paged_ranges = paged_ranges
+    return plan
+
+
+def ragged_indexer_logits(*, q_indexer, weights, gather, plan: RaggedIndexerPlan):
+    """gather(seq_len_tensor, page_indices, seq_len_sum, max_seq_len) -> (k_u8, scale_u8)."""
+    import deep_gemm
+
+    k_u8, scale_u8 = gather(
+        plan.gather_lens, plan.gather_pages, plan.seq_len_sum, plan.max_seq_len
+    )
+    return deep_gemm.fp8_mqa_logits(
+        q_indexer[: plan.rows],
+        (k_u8.view(FP8_DTYPE), scale_u8.view(torch.float32).squeeze(-1)),
+        weights[: plan.rows],
+        plan.ks,
+        plan.ke,
+        clean_logits=False,
+        max_seqlen_k=plan.max_seqlen_k,
+    )
+
+
+class _RaggedIndexerMixin:
+    """Mixed into C4IndexerBackendMixin below (kept separate for readability)."""
+
+    def eager_ragged_indexer_supported(
+        self, c4_indexer: C4Indexer, forward_batch: ForwardBatch
+    ) -> bool:
+        if not envs.SGLANG_DSV4_INDEXER_EAGER_RAGGED.get():
+            return False
+        if forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            return False
+        if c4_indexer.use_fp4_indexer:
+            return False
+        if (
+            not is_cuda()
+            or is_hip()
+            or is_xpu()
+            or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+        ):
+            return False
+        if self.hisparse_coordinator is not None:
+            return False
+        if self.debug_use_external_c4_sparse_indices:
+            return False
+        # The verify rows' paged top-k reads the v2 plan PagedIndexerMetadata
+        # builds only when top-k v2 is enabled.
+        if not self.dsa_topk_backend.should_use_topk_v2():
+            return False
+        if get_parallel().attn_cp_size != 1:
+            return False
+        if get_global_indexer_capturer() is not None:
+            return False
+        return True
+
+    def _ragged_step_plan(
+        self,
+        forward_batch: ForwardBatch,
+        indexer_metadata: PagedIndexerMetadata,
+        c4_indexer: C4Indexer,
+    ) -> RaggedIndexerStepPlan:
+        plan = forward_batch.ragged_indexer_plan
+        if plan is not None:
+            return plan
+        real = int(forward_batch.num_token_non_padded_cpu)
+        mixed_t = forward_batch.mixed_num_prefill_tokens
+        n_pre = forward_batch.mixed_num_prefill_rows
+        if mixed_t is None:
+            mixed_t = real
+            n_pre = int(forward_batch.batch_size)
+        mixed_t = int(mixed_t)
+        n_pre = int(n_pre)
+        ext = [int(v) for v in list(forward_batch.extend_seq_lens_cpu)[:n_pre]]
+        seq_lens_cpu = [int(v) for v in forward_batch.seq_lens_cpu[:n_pre].tolist()]
+        plan = build_ragged_indexer_plan(
+            ext_lens=ext,
+            seq_lens=seq_lens_cpu,
+            c4_seq_lens_all=indexer_metadata.c4_seq_lens,
+            page_table_all=indexer_metadata.page_table,
+            max_c4_seq_len=int(indexer_metadata.max_c4_seq_len),
+            c4_page_size=indexer_metadata.c4_page_size,
+            topk=c4_indexer.index_topk,
+            mixed_t=mixed_t,
+            real=real,
+        )
+        for a, b in plan.paged_ranges:
+            rng = PagedIndexerRange()
+            rng.a, rng.b = a, b
+            rng.meta = PagedIndexerMetadata(
+                page_size=indexer_metadata.page_size,
+                page_table=indexer_metadata.page_table[a:b],
+                c4_seq_lens=indexer_metadata.c4_seq_lens[a:b],
+                force_deep_gemm_metadata=indexer_metadata.force_deep_gemm_metadata,
+                use_prefill_cuda_graph=False,
+            )
+            plan.paged.append(rng)
+        forward_batch.ragged_indexer_plan = plan
+        return plan
+
+    def forward_c4_indexer_eager(
+        self,
+        *,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        c4_indexer: C4Indexer,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Indexer logits + top-k on the real rows (eager). The indexer
+        compressor (K cache write) already ran inside the captured segment."""
+        if forward_batch.forward_mode.is_idle():
+            return
+        token_to_kv_pool = self.token_to_kv_pool
+        metadata = self.forward_metadata
+        indexer_metadata = metadata.indexer_metadata
+        core_metadata = metadata.core_metadata
+        assert isinstance(indexer_metadata, PagedIndexerMetadata)
+        plan = self._ragged_step_plan(forward_batch, indexer_metadata, c4_indexer)
+        real = plan.real
+        if real == 0:
+            return
+        positions = core_metadata.positions[:real]
+        x = x[:real]
+        q_lora = q_lora[:real]
+        weights = c4_indexer.compute_weights(x, skip_scale=True)
+        q_indexer, weights = c4_indexer.compute_q(q_lora, positions, weights)
+        assert len(q_indexer.shape) == 3 and len(weights.shape) == 3
+        weights = weights.squeeze(2)
+        sparse_idx = core_metadata.c4_sparse_page_indices
+        raw_all = core_metadata.c4_sparse_raw_indices
+        c4_page_size = indexer_metadata.c4_page_size
+
+        rg = plan.ragged
+        if rg is not None:
+            layer_id = c4_indexer.layer_id
+
+            def gather(seq_len_tensor, page_indices, seq_len_sum, max_seq_len):
+                return token_to_kv_pool.get_index_k_scale_buffer(
+                    layer_id=layer_id,
+                    seq_len_tensor=seq_len_tensor,
+                    page_indices=page_indices,
+                    seq_len_sum=seq_len_sum,
+                    max_seq_len=max_seq_len,
+                )
+
+            logits = ragged_indexer_logits(
+                q_indexer=q_indexer, weights=weights, gather=gather, plan=rg
+            )
+            n = rg.rows
+            topk_transform_512_v2(
+                logits,
+                rg.lens,
+                indexer_metadata.page_table[:n],
+                sparse_idx[:n],
+                c4_page_size,
+                rg.topk_meta,
+                raw_all[:n] if raw_all is not None else None,
+            )
+        if plan.paged:
+            from deep_gemm import fp8_paged_mqa_logits
+
+            cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=c4_indexer.layer_id
+            )
+            assert cache.dim() == 2
+            cache = cache.view(cache.shape[0], 64, 1, 132)
+            q = q_indexer.unsqueeze(1)
+            for rng in plan.paged:
+                a, b = rng.a, rng.b
+                meta = rng.meta
+                c4sl = meta.c4_seq_lens
+                if c4sl.dim() == 1:
+                    c4sl = c4sl.unsqueeze(-1)
+                logits = fp8_paged_mqa_logits(
+                    q[a:b],
+                    cache,
+                    weights[a:b],
+                    c4sl,
+                    meta.page_table,
+                    meta.deep_gemm_metadata,
+                    meta.max_c4_seq_len,
+                    False,
+                )
+                topk_transform_512_v2(
+                    logits,
+                    meta.c4_seq_lens.reshape(-1).to(torch.int32).contiguous(),
+                    meta.page_table,
+                    sparse_idx[a:b],
+                    c4_page_size,
+                    meta.topk_metadata,
+                    raw_all[a:b] if raw_all is not None else None,
+                )
+
+
+class C4IndexerBackendMixin(_RaggedIndexerMixin):
     def __init__(self):
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False

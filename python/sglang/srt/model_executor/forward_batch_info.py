@@ -484,6 +484,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Output slice the DeepSeek-V4 attention layer publishes for the mixed step;
     # the backend writes both populations into it and returns it.
     attn_output_buffer: Optional[torch.Tensor] = None
+    # DeepSeek-V4 eager ragged C4 indexer: the step's ragged/paged row plan, built
+    # by the first C4 layer of the step and reused by the others.
+    ragged_indexer_plan: Optional[object] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
