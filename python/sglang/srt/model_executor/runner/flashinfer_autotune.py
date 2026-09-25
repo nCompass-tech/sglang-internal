@@ -267,15 +267,23 @@ def maybe_flashinfer_autotune_extend(
     num_tokens = mr.server_args.max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
-    if not mr.is_generation or mr.spec_algorithm.is_speculative():
-        # _dummy_run forces TARGET_VERIFY shapes for speculative runners;
-        # extend-bucket autotune for spec configs is a follow-up.
+    if not mr.is_generation:
+        return
+    if mr.spec_algorithm.is_speculative() and mr.is_draft_worker:
+        # The target worker of a speculative config runs the EXTEND-shaped
+        # pass too (_dummy_run honours the override for it); the draft worker
+        # is skipped.
         return
     if mr.model_config.is_multimodal:
         # The dummy runs mm_inputs=None, which multimodal prefill paths iterate.
         return
 
-    if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
+    if (
+        mr.attn_backend.extend_dummy_seqs_capped_by_req_pool
+        or mr.spec_algorithm.is_speculative()
+    ):
+        # Speculative target workers are packed too, keeping page-table
+        # indexing in range (e.g. DSV4 under speculative configs).
         pool_size = mr.req_to_token_pool.size
         num_tokens_per_req = (num_tokens + pool_size - 1) // pool_size
     else:

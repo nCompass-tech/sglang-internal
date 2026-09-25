@@ -412,7 +412,19 @@ class BaseRunner(ABC):
         _is_pd_prefill_target = (
             mr.server_args.disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
-        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
+        # An explicit EXTEND override on the speculative target worker is
+        # honoured (FlashInfer extend-bucket autotune); everything else keeps
+        # the TARGET_VERIFY shape.
+        _extend_autotune_override = (
+            forward_mode_override == ForwardMode.EXTEND
+            and mr.spec_algorithm.is_speculative()
+            and not mr.is_draft_worker
+        )
+        if (
+            mr.spec_algorithm.is_speculative()
+            and not _is_pd_prefill_target
+            and not _extend_autotune_override
+        ):
             if mr.is_draft_worker:
                 assert (
                     mr.spec_algorithm.supports_target_verify_for_draft()
@@ -420,9 +432,8 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
         if extend_num_tokens_per_req is not None:
-            assert (
-                capture_forward_mode == ForwardMode.EXTEND
-                and not mr.spec_algorithm.is_speculative()
+            assert capture_forward_mode == ForwardMode.EXTEND and (
+                not mr.spec_algorithm.is_speculative() or _extend_autotune_override
             ), "extend_num_tokens_per_req requires a non-speculative EXTEND dummy"
             num_tokens_per_req = extend_num_tokens_per_req
 
