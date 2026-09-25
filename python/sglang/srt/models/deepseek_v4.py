@@ -436,6 +436,12 @@ def deepseek_v4_attention_with_output(
     original_out_cache_loc = forward_batch.out_cache_loc
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
+    # Publish this layer's output slice: the backend's dual-population mixed
+    # branch writes both attention populations straight into it instead of
+    # concatenating them into a new tensor that is then copied here.
+    out_view = output[:real_num_tokens]
+    forward_batch.attn_output_buffer = out_view
+
     attn_backend = get_attn_backend()
     try:
         ret = attn_backend.forward(
@@ -450,6 +456,10 @@ def deepseek_v4_attention_with_output(
         )
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.attn_output_buffer = None
+
+    if ret is out_view:
+        return  # the backend wrote the mixed-step output in place
 
     assert (
         output[:real_num_tokens].numel() == ret.numel()

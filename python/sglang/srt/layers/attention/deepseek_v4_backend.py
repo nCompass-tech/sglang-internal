@@ -1898,6 +1898,17 @@ class DeepseekV4AttnBackend(
                         else extra_topk_lengths[mixed_t:]
                     ),
                 )[0]
+                # Write both populations straight into the output slice the
+                # attention layer published (it skips its copy when it gets
+                # that slice back). No slice published -> cat path.
+                out = forward_batch.attn_output_buffer
+                if out is not None:
+                    n_head = o_head.shape[0]
+                    tail = o_tail.reshape(o_tail.shape[0], *o_head.shape[1:])
+                    out_v = out.view(n_head + tail.shape[0], *o_head.shape[1:])
+                    out_v[:n_head].copy_(o_head)
+                    out_v[n_head:].copy_(tail)
+                    return out
                 return torch.cat([o_head, o_tail.squeeze(1)], dim=0)
 
             if _is_sm120:

@@ -481,6 +481,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # positions (FP8 in-place target-verify path). None -> single population.
     mixed_num_prefill_rows: Optional[int] = None
     mixed_num_prefill_tokens: Optional[int] = None
+    # Output slice the DeepSeek-V4 attention layer publishes for the mixed step;
+    # the backend writes both populations into it and returns it.
+    attn_output_buffer: Optional[torch.Tensor] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
