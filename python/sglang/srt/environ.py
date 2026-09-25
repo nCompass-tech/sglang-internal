@@ -921,6 +921,9 @@ class Envs:
     # with one ragged non-paged launch per layer (v2 top-k), outside the captured
     # segment; verify rows keep the paged kernel. Opt-in.
     SGLANG_DSV4_INDEXER_EAGER_RAGGED = EnvBool(False)
+    # DeepSeek-V4: copy only this rank's TP-local attention heads into the segment
+    # output buffer; the other heads are left stale (consumers read only the TP slice).
+    SGLANG_DSV4_INDEXER_TP_LOCAL_COPY = EnvBool(False)
 
     # ===================================================================
     # Triton and Torch compilation

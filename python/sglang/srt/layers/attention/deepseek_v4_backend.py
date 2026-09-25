@@ -17,6 +17,8 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged,
@@ -85,6 +87,42 @@ _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _copy_tp_local_heads_kernel(
+    src_ptr, dst_ptr, src_stride, dst_stride, n_elems, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elems
+    x = tl.load(src_ptr + row.to(tl.int64) * src_stride + offs, mask=mask)
+    tl.store(dst_ptr + row.to(tl.int64) * dst_stride + offs, x, mask=mask)
+
+
+def copy_tp_local_heads(dst: torch.Tensor, src: torch.Tensor, n_real: int) -> None:
+    """dst[:, :n_real] = src[:, :n_real] for [rows, H, DV] tensors whose (H, DV)
+    dims are contiguous: one contiguous n_real*DV run per row (torch's strided
+    copy_ for this pattern runs at ~1/3 of the DtoD memcpy bandwidth)."""
+    rows, H, DV = dst.shape
+    if rows == 0:
+        return
+    assert src.shape[0] == rows and src.shape[1] == H and src.shape[2] == DV
+    assert (
+        dst.stride(2) == 1
+        and src.stride(2) == 1
+        and dst.stride(1) == DV
+        and src.stride(1) == DV
+    )
+    n = n_real * DV
+    # One program per 32 KB row run (sweep: 70 us vs 74 us at 4096 rows / 4 warps,
+    # full copy 94 us).
+    BLOCK = 16384
+    grid = (rows, triton.cdiv(n, BLOCK))
+    _copy_tp_local_heads_kernel[grid](
+        src, dst, src.stride(0), dst.stride(0), n, BLOCK=BLOCK, num_warps=8
+    )
+
 
 SWA_WINDOW = 128
 C4_TOPK = 512
@@ -1906,8 +1944,20 @@ class DeepseekV4AttnBackend(
                     n_head = o_head.shape[0]
                     tail = o_tail.reshape(o_tail.shape[0], *o_head.shape[1:])
                     out_v = out.view(n_head + tail.shape[0], *o_head.shape[1:])
-                    out_v[:n_head].copy_(o_head)
-                    out_v[n_head:].copy_(tail)
+                    # The model consumes only heads [0, layer.tp_q_head_num) of
+                    # this buffer (`o = o[:, tp_slice, :]`, deepseek_v4.py); the
+                    # rest are TP padding for FlashMLA's head64 kernels, so they
+                    # may be left stale (test_dsv4_indexer_half_copy.py).
+                    n_real = layer.tp_q_head_num
+                    if (
+                        envs.SGLANG_DSV4_INDEXER_TP_LOCAL_COPY.get()
+                        and 0 < n_real < out_v.shape[1]
+                    ):
+                        copy_tp_local_heads(out_v[:n_head], o_head, n_real)
+                        copy_tp_local_heads(out_v[n_head:], tail, n_real)
+                    else:
+                        out_v[:n_head].copy_(o_head)
+                        out_v[n_head:].copy_(tail)
                     return out
                 return torch.cat([o_head, o_tail.squeeze(1)], dim=0)
 

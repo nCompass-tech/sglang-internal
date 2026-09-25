@@ -1637,6 +1637,8 @@ class MQALayer(MqaAttentionBase):
                     attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
                 )
+            # Only heads [tp_slice] may be read: with SGLANG_DSV4_INDEXER_TP_LOCAL_COPY
+            # the other heads of `o` are stale (test_dsv4_indexer_half_copy.py).
             o = o[:, tp_slice, :]
         if _is_npu:
             cos4, sin4 = self._get_npu_rope_position_cache(
