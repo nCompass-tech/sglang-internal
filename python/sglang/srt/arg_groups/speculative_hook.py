@@ -418,9 +418,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
     if server_args.enable_mixed_chunk:
-        server_args.enable_mixed_chunk = False
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
+        # DSPARK supports the verify-merged mixed step: running rows ride their
+        # draft positions on the prefill forward.
+        logger.info(
+            "Mixed chunked prefill enabled with DSPARK: running requests verify "
+            "inside prefill steps (verify-merged mixed step)."
         )
 
     from sglang.srt.speculative.ragged_verify import (

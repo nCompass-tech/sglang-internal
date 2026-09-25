@@ -9190,10 +9190,15 @@ class ServerArgs:
         self.check_lora_server_args()
 
         # Check speculative decoding
-        if self.speculative_algorithm is not None:
-            assert (
-                not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+        if self.speculative_algorithm is not None and self.enable_mixed_chunk:
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            assert SpeculativeAlgorithm.from_string(
+                self.speculative_algorithm
+            ).supports_mixed_chunk(), (
+                "enable_mixed_chunk is only supported with speculative algorithms "
+                "that implement a mixed step (DSPARK verify-merged mixed prefill)"
+            )
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

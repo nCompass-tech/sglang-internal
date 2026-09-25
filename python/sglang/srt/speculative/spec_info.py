@@ -128,6 +128,12 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def supports_mixed_chunk(self) -> bool:
+        """Whether a mixed chunked-prefill step may carry this algorithm's running
+        rows. DSPARK: verify-merged mixed step -- running rows contribute their
+        draft positions to the extend-shaped forward."""
+        return self.is_dspark()
+
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify

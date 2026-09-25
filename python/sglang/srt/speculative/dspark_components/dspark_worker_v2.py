@@ -1,3 +1,4 @@
+import copy
 import logging
 from contextlib import nullcontext
 from dataclasses import replace
@@ -11,18 +12,22 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
     compute_position,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -425,12 +430,313 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
+        if batch.forward_mode.is_mixed() and batch.num_prefill_rows is not None:
+            # Verify-merged mixed step.
+            self._verify_planner.note_non_decode_step()
+            self._observers.note_prefill_step()
+            return self._forward_mixed(batch, on_publish)
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
+
+    @staticmethod
+    def _slice_sampling_info(si, lo: int, hi: int, reqs):
+        """Row-slice a forward-only SamplingBatchInfo (orchestrator already None)."""
+        if si is None:
+            return None
+        out = replace(si)
+        for name in (
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "min_ps",
+            "sampling_seed",
+            "logit_bias",
+        ):
+            v = getattr(si, name, None)
+            if v is not None:
+                setattr(out, name, v[lo:hi])
+        if si.return_sampling_masks is not None:
+            out.return_sampling_masks = si.return_sampling_masks[lo:hi]
+        out.grammars = None
+        out.is_all_greedy = all(r.sampling_params.top_k <= 1 for r in reqs)
+        out.is_any_greedy = any(r.sampling_params.top_k <= 1 for r in reqs)
+        return out
+
+    def _forward_mixed(self, batch: ScheduleBatch, on_publish) -> GenerationBatchResult:
+        """One target forward carrying the prefill chunk's tokens (extend rows)
+        and every running request's verify positions (bonus + drafts). The draft
+        phase stays separate. The expert weights are streamed once for both
+        populations; the running rows are verified with the prefill-shaped
+        (ragged causal extend) attention metadata, which is what TARGET_VERIFY
+        builds in the dsv4 backend anyway.
+
+        Layout: rows [0, n_pre) prefill, rows [n_pre, bs) verify (width W each).
+        """
+        n_pre = int(batch.num_prefill_rows)
+        bs = batch.batch_size()
+        n_tail = bs - n_pre
+        W = int(self.verify_num_draft_tokens)
+        device = self.device
+        draft_input = batch.spec_info
+        if not isinstance(draft_input, DFlashDraftInputV2) or n_tail <= 0:
+            raise RuntimeError(
+                f"mixed step expects DFlashDraftInputV2 draft state for {n_tail} "
+                f"running rows, got {type(draft_input).__name__}"
+            )
+        if batch.input_ids is None or batch.out_cache_loc is None:
+            raise RuntimeError(
+                "mixed step: prefill input_ids / out_cache_loc not resolved"
+            )
+        if batch.seq_lens_cpu is None:
+            raise RuntimeError("mixed step: seq_lens_cpu required (prefill metadata)")
+
+        prefill_ids = batch.input_ids
+        prefill_cache_loc = batch.out_cache_loc
+        n_pre_tokens = int(prefill_ids.shape[0])
+        tail_reqs = batch.reqs[n_pre:]
+        sampling_info = batch.sampling_info
+        si_pre = self._slice_sampling_info(sampling_info, 0, n_pre, batch.reqs[:n_pre])
+        si_tail = self._slice_sampling_info(sampling_info, n_pre, bs, tail_reqs)
+
+        # --- tail view (running rows at their committed base) for the draft phase
+        tail = copy.copy(batch)
+        tail.reqs = tail_reqs
+        tail.seq_lens = batch.seq_lens[n_pre:]
+        tail.seq_lens_cpu = batch.seq_lens_cpu[n_pre:]
+        tail.seq_lens_sum = int(tail.seq_lens_cpu.sum())
+        tail.req_pool_indices = batch.req_pool_indices[n_pre:]
+        tail.req_pool_indices_cpu = batch.req_pool_indices_cpu[n_pre:]
+        tail.forward_mode = ForwardMode.DECODE
+        tail.spec_info = draft_input
+        tail.sampling_info = si_tail
+        tail.input_ids = None
+        tail.out_cache_loc = None
+        tail.num_prefill_rows = None
+        tail.mixed_verify_width = None
+        tail.global_num_tokens = None
+        tail.global_num_tokens_for_logprob = None
+        tail.has_grammar = False
+        tail.return_logprob = False
+        prefix_lens = tail.seq_lens
+        tail.seq_lens.record_stream(torch.get_device_module(device).current_stream())
+
+        self._observers.begin_step()
+        target_model = self.target_worker.model_runner.model
+        verify_window = alloc_verify_window(
+            batch=tail,
+            bs=n_tail,
+            device=device,
+            verify_num_draft_tokens=W,
+            block_pos_offsets=self._block_pos_offsets,
+            model_runner=self.model_runner,
+        )
+        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+            proposal = self._proposer.propose(
+                batch=tail,
+                draft_input=draft_input,
+                verify_window=verify_window,
+                bs=n_tail,
+                device=device,
+                target_model=target_model,
+                sampling_info=si_tail,
+            )
+        draft_block_ids = proposal.draft_block_ids
+        draft_block = proposal.draft_block
+        draft_tokens = draft_block.draft_tokens
+        verify_ids_2d = torch.cat(
+            [draft_block_ids[:, :1], draft_tokens], dim=1
+        ).contiguous()
+
+        # --- merged extend-shaped forward: [prefill tokens | W verify tokens per tail row]
+        batch.input_ids = torch.cat([prefill_ids, verify_ids_2d.reshape(-1)])
+        batch.out_cache_loc = torch.cat(
+            [
+                prefill_cache_loc,
+                verify_window.verify_cache_loc.to(prefill_cache_loc.dtype),
+            ]
+        )
+        seq_lens = batch.seq_lens.clone()
+        seq_lens[n_pre:] += W
+        batch.seq_lens = seq_lens
+        seq_lens_cpu = batch.seq_lens_cpu.clone()
+        seq_lens_cpu[n_pre:] += W
+        batch.seq_lens_cpu = seq_lens_cpu
+        batch.seq_lens_sum = int(seq_lens_cpu.sum())
+        batch.spec_info = None  # extend-shaped forward: no spec input object
+        prepare_mamba_track_for_verify(tail)
+        # The tail rows' committed lengths are exact only on the device
+        # (`prefix_lens` above == batch.seq_lens[n_pre:] before the +W), while
+        # the host lists hold a one-verify-stale estimate. Hand device tensors to
+        # ForwardBatch.init_new so positions / extend_start_loc come from the
+        # exact values (gpu-only extend path); keep the host lists as mirrors.
+        extend_lens_list = list(batch.extend_lens)
+        prefix_lens_list = list(batch.prefix_lens)
+        # Pageable-source non_blocking H2D (no stream sync), as ForwardBatch.init_new does.
+        head_prefix = torch.tensor(prefix_lens_list[:n_pre], dtype=torch.int32).to(
+            device, non_blocking=True
+        )
+        head_extend = torch.tensor(extend_lens_list[:n_pre], dtype=torch.int32).to(
+            device, non_blocking=True
+        )
+        batch.prefix_lens = torch.cat([head_prefix, prefix_lens.to(torch.int32)])
+        batch.extend_lens = torch.cat(
+            [head_extend, torch.full((n_tail,), W, dtype=torch.int32, device=device)]
+        )
+        fb = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
+        )
+        fb.extend_seq_lens_cpu = extend_lens_list[:n_pre] + [W] * n_tail
+        fb.extend_prefix_lens_cpu = prefix_lens_list[:n_pre] + [
+            int(x) - W for x in batch.seq_lens_cpu[n_pre:].tolist()
+        ]
+        batch.extend_lens = extend_lens_list
+        batch.prefix_lens = prefix_lens_list
+        starts = fb.extend_start_loc
+        lens = fb.extend_seq_lens
+        idx_pre = (starts[:n_pre] + lens[:n_pre] - 1).to(torch.int64)
+        idx_tail = (
+            starts[n_pre:].to(torch.int64).unsqueeze(1)
+            + self._block_pos_offsets[:W].to(torch.int64).unsqueeze(0)
+        ).reshape(-1)
+        fb.mixed_logits_select_index = torch.cat([idx_pre, idx_tail])
+        # Dual-population attention split for the DSV4 backend.
+        fb.mixed_num_prefill_rows = n_pre
+        fb.mixed_num_prefill_tokens = int(prefill_ids.shape[0])
+
+        with self._observers.segment(InfoSegment.TARGET_VERIFY):
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None, forward_batch=fb, is_verify=True
+            )
+        logits_output = target_out.logits_output
+        can_run_cuda_graph = bool(target_out.can_run_cuda_graph)
+        logits = logits_output.next_token_logits
+        hidden = logits_output.hidden_states
+        if hidden is None:
+            raise RuntimeError(
+                "mixed step requires target aux hidden capture, got None"
+            )
+        if logits.shape[0] != n_pre + n_tail * W:
+            raise RuntimeError(
+                f"mixed step logits rows {logits.shape[0]} != {n_pre} + {n_tail}*{W}"
+            )
+
+        # --- prefill rows: sample the first token, inject target hidden into the
+        # draft KV, seed the draft state (same as _forward_prefill).
+        pre_logits_output = LogitsProcessorOutput(next_token_logits=logits[:n_pre])
+        fb_pre = copy.copy(fb)
+        fb_pre.forward_mode = ForwardMode.EXTEND
+        fb_pre.sampling_info = si_pre
+        fb_pre.seq_lens = fb.seq_lens[:n_pre]
+        fb_pre.return_logprob = False
+        fb_pre.top_logprobs_nums = None
+        fb_pre.token_ids_logprobs = None
+        next_token_ids_pre = self.model_runner.sample(pre_logits_output, fb_pre)
+        pre_hidden = hidden[:n_pre_tokens]
+        state_slot = final_pos = None
+        if is_unified_kv_triton():
+            ctx_lens = fb.extend_seq_lens[:n_pre].to(torch.int64)
+            repeats = ctx_lens
+            state_slot = torch.repeat_interleave(
+                batch.req_pool_indices[:n_pre].to(device=device, dtype=torch.int64),
+                repeats,
+            )
+            final_pos = torch.repeat_interleave(
+                (fb.extend_prefix_lens[:n_pre].to(torch.int64) + ctx_lens - 1), repeats
+            )
+        self._kv_injector.inject_target_hidden(
+            target_hidden=pre_hidden,
+            cache_loc=prefill_cache_loc,
+            positions=fb.positions[:n_pre_tokens],
+            state_slot=state_slot,
+            final_pos=final_pos,
+        )
+        pre_new_seq_lens = fb.seq_lens[:n_pre]
+
+        # --- verify rows: accept / finalize / commit (eager, non-compact layout)
+        tail_logits = logits[n_pre:]
+        if si_tail is not None:
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=tail_logits, sampling_info=si_tail, draft_token_num=W
+            )
+        accept = self._verify_executor.accept_and_finalize(
+            folded_accept=False,
+            bs=n_tail,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=tail_logits,
+            draft_block=draft_block,
+            sampling_info=si_tail,
+            draft_input=draft_input,
+            layout=None,
+            prefix_lens=prefix_lens,
+            draft_tokens=draft_tokens,
+        )
+        tail_hidden = hidden[n_pre_tokens : n_pre_tokens + n_tail * W]
+        self._commit_target_mamba_states_after_verify(
+            batch=tail,
+            seq_lens_pre_verify=prefix_lens,
+            seq_lens_post_verify=accept.new_seq_lens,
+            commit_lens=accept.commit_lens,
+        )
+        self._verify_executor.commit_hidden(
+            batch=tail,
+            layout=None,
+            hidden_strided=None,
+            verify_window=verify_window,
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=None, hidden_states=tail_hidden
+            ),
+            commit_lens=accept.commit_lens,
+            bs=n_tail,
+            run_compact=False,
+        )
+        logits_output.hidden_states = None
+
+        new_seq_lens = torch.cat(
+            [pre_new_seq_lens.to(torch.int64), accept.new_seq_lens.to(torch.int64)]
+        )
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+        next_draft_input = make_next_draft_input(
+            bonus_tokens=torch.cat(
+                [next_token_ids_pre.to(torch.int64), accept.bonus.to(torch.int64)]
+            ),
+            new_seq_lens=new_seq_lens,
+        )
+        next_token_ids = torch.cat(
+            [
+                next_token_ids_pre.to(torch.int64),
+                accept.out_tokens.reshape(-1).to(torch.int64),
+            ]
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "mixed step: prefill_rows=%d prefill_tokens=%d verify_rows=%d width=%d graph=%s",
+                n_pre,
+                n_pre_tokens,
+                n_tail,
+                W,
+                can_run_cuda_graph,
+            )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            accept_lens=accept.commit_lens,
+            block_accept_lens=accept.commit_lens + accept.cap_trim_lens,
+            cap_lens=None,
+            can_run_cuda_graph=can_run_cuda_graph,
+            next_draft_input=next_draft_input,
+            speculative_num_draft_tokens=W,
+            new_seq_lens=new_seq_lens,
+            extend_input_len_per_req=list(batch.extend_lens[:n_pre]),
+        )
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish

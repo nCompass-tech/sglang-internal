@@ -29,11 +29,15 @@ def maybe_publish_prefill_shared_read_done(
     """Publish prefill read-done after compliant metadata initialization."""
     if not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get():
         return
-    if forward_batch.forward_mode != ForwardMode.EXTEND:
+    if forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
         return
-    # TODO(Jialin): Relax this gate for speculative decoding after its prefill
-    # WAR boundaries are validated.
-    if not model_runner.spec_algorithm.is_none():
+    # DSPARK v2's prefill and verify-merged mixed steps finish every
+    # scheduler-shared read in metadata init (audited in the DSV4 backend, which
+    # alone declares PRE_REPLAY for extend); their post-forward ops (accept /
+    # commit / publish / draft-KV inject) read speculative buffers only. Other
+    # speculative workers keep the conservative gate.
+    spec_algorithm = model_runner.spec_algorithm
+    if not (spec_algorithm.is_none() or spec_algorithm.is_dspark()):
         return
     # The record lands right after replay prep, so PRE_REPLAY only.
     declared = model_runner.attn_backend.shared_read_ends(forward_batch.forward_mode)

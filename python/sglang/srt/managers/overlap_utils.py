@@ -472,6 +472,41 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
+
+        if batch.forward_mode.is_mixed() and batch.num_prefill_rows is not None:
+            # Verify-merged mixed step: only the tail rows (running requests)
+            # have a relayed length; the prefill rows keep their scheduled
+            # lengths.
+            n = batch.num_prefill_rows
+            tail = self.new_seq_lens_buf[fi]
+            # Exact committed lengths of the tail rows stay on the device
+            # (batch.seq_lens[n:]); the worker builds the tail rows' prefix /
+            # extend lengths and positions from them (ForwardBatch gpu-only
+            # path), so no D2H is needed here and the scheduler keeps running
+            # ahead of the GPU across mixed iterations.
+            batch.seq_lens = torch.cat([batch.seq_lens[:n], tail])
+            # Host mirror: head rows exact (scheduled lengths); tail rows an
+            # upper-bound estimate -- kv_committed_len lags the device value by
+            # at most one verify of `mixed_verify_width` tokens. Only capacity
+            # bounds (max_seq_len, seq_lens_sum) read the tail's host values.
+            width = int(batch.mixed_verify_width or 0)
+            if batch.seq_lens_cpu is not None:
+                head_cpu = batch.seq_lens_cpu[:n]
+            else:
+                head_cpu = torch.tensor(
+                    [
+                        p + e
+                        for p, e in zip(batch.prefix_lens[:n], batch.extend_lens[:n])
+                    ],
+                    dtype=torch.int64,
+                )
+            tail_est = torch.tensor(
+                [int(p) + width for p in batch.prefix_lens[n:]], dtype=head_cpu.dtype
+            )
+            batch.seq_lens_cpu = torch.cat([head_cpu, tail_est])
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            return
+
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:

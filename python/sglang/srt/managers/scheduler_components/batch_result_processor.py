@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass
 from typing import (
@@ -29,6 +30,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
 )
@@ -801,6 +803,70 @@ class SchedulerBatchResultProcessor:
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
+
+    def process_batch_result_mixed(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        """Verify-merged mixed step: rows [0, n) are prefill rows (one sampled
+        token each), rows [n, bs) are verify rows (stride
+        speculative_num_draft_tokens with accept_lens). Split the batch/result
+        positionally and run the two existing processors on the slices."""
+        n = int(batch.num_prefill_rows)
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+            result.copy_done = None
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+            result.routed_experts_output = None
+        if result.indexer_topk_output is not None:
+            result.indexer_topk_output.finalize()
+            result.indexer_topk_output = None
+
+        pre = copy.copy(batch)
+        pre.reqs = batch.reqs[:n]
+        pre.forward_mode = ForwardMode.EXTEND
+        pre.decoding_reqs = None
+        pre.num_prefill_rows = None
+        pre.extend_lens = list(batch.extend_lens[:n]) if batch.extend_lens else None
+        pre.prefix_lens = list(batch.prefix_lens[:n]) if batch.prefix_lens else None
+        r_pre = copy.copy(result)
+        r_pre.next_token_ids = result.next_token_ids[:n]
+        r_pre.accept_lens = None
+        r_pre.block_accept_lens = None
+        r_pre.cap_lens = None
+        r_pre.next_draft_input = None
+        r_pre.extend_input_len_per_req = (
+            list(result.extend_input_len_per_req[:n])
+            if result.extend_input_len_per_req is not None
+            else None
+        )
+        # Count merged steps explicitly. The two sub-processors below each bump their own
+        # cuda_graph_passes_total label, so a merged step already shows up once
+        # under prefill_* AND once under decode_*; this extra label makes the
+        # merged rate readable directly (iterations/s = decode_* rate; merged
+        # steps/s = mixed_* rate). No behaviour change.
+        if get_observability().enable_metrics:
+            self.metrics_collector.cuda_graph_passes_total.labels(
+                **self.metrics_collector.labels,
+                mode="mixed_cuda_graph" if result.can_run_cuda_graph else "mixed_none",
+            ).inc(1)
+        self.process_batch_result_prefill(pre, r_pre)
+
+        dec = copy.copy(batch)
+        dec.reqs = batch.reqs[n:]
+        dec.forward_mode = ForwardMode.DECODE
+        dec.decoding_reqs = None
+        dec.num_prefill_rows = None
+        r_dec = copy.copy(result)
+        r_dec.next_token_ids = result.next_token_ids[n:]
+        self.process_batch_result_decode(dec, r_dec)
+        # carry the decode-side counters back for the caller's stats
+        result.num_correct_drafts = r_dec.num_correct_drafts
+        result.num_correct_drafts_per_req_cpu = r_dec.num_correct_drafts_per_req_cpu
+        result.num_block_accept_tokens = r_dec.num_block_accept_tokens
+        result.num_cap_tokens = r_dec.num_cap_tokens
 
     def process_batch_result_decode(
         self,

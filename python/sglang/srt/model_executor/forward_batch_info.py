@@ -470,6 +470,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Verify-merged mixed step (DSPARK + --enable-mixed-chunk): rows of
+    # hidden_states that the logits processor must keep (last token of each
+    # prefill row + every verify position of each running row). None -> default
+    # pruning.
+    mixed_logits_select_index: Optional[torch.Tensor] = None
+    # Dual-population attention: rows [0, mixed_num_prefill_rows) /
+    # tokens [0, mixed_num_prefill_tokens) are prefill rows (sparse prefill
+    # attention path); the remaining tokens are the running rows' verify
+    # positions (FP8 in-place target-verify path). None -> single population.
+    mixed_num_prefill_rows: Optional[int] = None
+    mixed_num_prefill_tokens: Optional[int] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA

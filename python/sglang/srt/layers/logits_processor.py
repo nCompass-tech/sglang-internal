@@ -218,6 +218,9 @@ class LogitsMetadata:
 
         if forward_batch.forward_mode.is_draft_extend_v2():
             draft_extend_select_index = forward_batch.spec_info.select_index
+        elif forward_batch.mixed_logits_select_index is not None:
+            # Verify-merged mixed step (extend-shaped forward).
+            draft_extend_select_index = forward_batch.mixed_logits_select_index
         else:
             draft_extend_select_index = None
 
@@ -454,6 +457,26 @@ class LogitsProcessor(nn.Module):
                     aux_hidden_states
                     if isinstance(aux_hidden_states, torch.Tensor)
                     else [hidden for hidden in aux_hidden_states]
+                )
+            sample_indices = None
+            input_logprob_indices = None
+
+        elif (
+            logits_metadata.forward_mode.is_extend()
+            and logits_metadata.draft_extend_select_index is not None
+        ):
+            # Verify-merged mixed step: explicit row selection (prefill rows'
+            # last token + every verify position of the running rows). The
+            # FULL-capture hidden stays unpruned for the draft KV injection.
+            sel = logits_metadata.draft_extend_select_index
+            pruned_states = hidden_states[sel]
+            if hidden_states_before_norm is not None:
+                pruned_states_before_norm = hidden_states_before_norm[sel]
+            if aux_hidden_states is not None:
+                aux_pruned_states = (
+                    aux_hidden_states[sel]
+                    if isinstance(aux_hidden_states, torch.Tensor)
+                    else [hidden[sel] for hidden in aux_hidden_states]
                 )
             sample_indices = None
             input_logprob_indices = None

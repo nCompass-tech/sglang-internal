@@ -2036,6 +2036,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
+    # Positional split of a MIXED batch under a speculative algorithm -- rows
+    # [0, num_prefill_rows) are extend rows, the remaining rows are running
+    # requests that each contribute mixed_verify_width verify positions
+    # (bonus + drafts) to the same forward.
+    num_prefill_rows: Optional[int] = None
+    mixed_verify_width: Optional[int] = None
 
     # For split prefill
     split_index: int = 0
@@ -2747,6 +2753,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: ScheduleBatch):
+        if not self.spec_algorithm.is_none():
+            return self._mix_with_running_spec(running_batch)
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
@@ -2777,6 +2785,55 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = (
             self.extend_logprob_start_lens + [0] * running_bs
         )
+        self.is_prefill_only = False
+
+    def _mix_with_running_spec(self, running_batch: ScheduleBatch):
+        """Verify-merged mixed step (DSPARK).
+
+        The running rows keep their speculative draft state (spec_info) and are
+        appended to the prefill batch as extend rows of `width` positions
+        (bonus token + drafts), starting at their committed length. The draft
+        tokens themselves are produced by the worker's draft phase, which appends
+        them to input_ids / out_cache_loc; here we only shape the batch. The
+        caller has already run running_batch.prepare_for_decode(), which reserved
+        the verify headroom in req_to_token and seeded committed seq_lens_cpu.
+        Under overlap, FutureMap.resolve_seq_lens_cpu rebinds the tails' lengths
+        (and prefix_lens) behind the publish fence at forward time.
+        """
+
+        width = int(get_spec().speculative_num_draft_tokens)
+        n_pre = self.batch_size()
+        running_bs = running_batch.batch_size()
+        assert running_bs > 0
+
+        self.forward_mode = ForwardMode.MIXED
+        committed = [int(r.kv_committed_len) for r in running_batch.reqs]
+
+        # input_ids: prefill part is staged on the host (prefill_input_ids_cpu),
+        # the verify part is appended by the worker after drafting. No bonus-token
+        # gather for the tails (mix_running_indices stays None).
+        self.input_ids = None
+        self.mix_running_indices = None
+
+        prefill_out_cache_loc = self.out_cache_loc
+        running_spec_info = running_batch.spec_info
+        self.merge_batch(running_batch)
+        if self.spec_info is None:
+            # merge_batch only merges into an existing spec_info; a fresh prefill
+            # batch has none, so adopt the running rows' draft state (M rows).
+            self.spec_info = running_spec_info
+        # The worker appends the verify window (M * width slots gathered from
+        # req_to_token) behind the prefill slots.
+        self.out_cache_loc = prefill_out_cache_loc
+
+        self.prefix_lens = self.prefix_lens + committed
+        self.extend_lens = self.extend_lens + [width] * running_bs
+        self.extend_num_tokens = self.extend_num_tokens + width * running_bs
+        self.extend_logprob_start_lens = (
+            self.extend_logprob_start_lens + [0] * running_bs
+        )
+        self.num_prefill_rows = n_pre
+        self.mixed_verify_width = width
         self.is_prefill_only = False
 
     def new_tokens_required_next_decode(
@@ -3037,6 +3094,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        # A decode batch is never a positional mixed split.
+        self.num_prefill_rows = None
+        self.mixed_verify_width = None
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -3162,6 +3222,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        # A filtered batch is no longer a positional mixed split.
+        self.num_prefill_rows = None
+        self.mixed_verify_width = None
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
@@ -3273,6 +3336,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
+        # A merged batch is no longer a positional mixed split;
+        # _mix_with_running_spec re-marks it after its own merge.
+        self.num_prefill_rows = None
+        self.mixed_verify_width = None
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
@@ -3294,6 +3361,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=self.return_hidden_states,
             return_hidden_states_mode=self.return_hidden_states_mode,
             decoding_reqs=self.decoding_reqs,
+            num_prefill_rows=self.num_prefill_rows,
+            mixed_verify_width=self.mixed_verify_width,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,

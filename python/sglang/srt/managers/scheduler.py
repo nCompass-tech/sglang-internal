@@ -3262,7 +3262,11 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            (
+                running_bs * self._mixed_tokens_per_running_row()
+                if self.is_mixed_chunk
+                else 0
+            ),
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -3435,6 +3439,12 @@ class Scheduler(
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            # Verify-merged mixed step: grammar-constrained rows take the
+            # eager verify path (grammar masks are not applied inside it).
+            and (
+                self.spec_algorithm.is_none()
+                or not (new_batch.has_grammar or running_batch.has_grammar)
+            )
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
@@ -3449,6 +3459,14 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _mixed_tokens_per_running_row(self) -> int:
+        """Prefill-budget charge per running row in a mixed step: 1 token for
+        plain decode rows, `speculative_num_draft_tokens` verify positions for
+        the DSPARK verify-merged mixed step."""
+        if self.spec_algorithm.is_none():
+            return 1
+        return int(get_spec().speculative_num_draft_tokens or 1)
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
@@ -3931,6 +3949,9 @@ class Scheduler(
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
+        elif batch.forward_mode.is_mixed() and batch.num_prefill_rows is not None:
+            # Verify-merged mixed step: prefill rows + verify rows.
+            self.batch_result_processor.process_batch_result_mixed(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -3959,8 +3980,11 @@ class Scheduler(
         self, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> None:
         mode = batch.forward_mode
-        is_prefill = mode.is_extend_without_speculative()
-        if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
+        is_mixed_spec = mode.is_mixed() and batch.num_prefill_rows is not None
+        is_prefill = mode.is_extend_without_speculative() and not is_mixed_spec
+        if not (
+            is_prefill or is_mixed_spec or mode.is_decode() or mode.is_target_verify()
+        ):
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
             return
