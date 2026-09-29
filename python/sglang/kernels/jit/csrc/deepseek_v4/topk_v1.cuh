@@ -2,6 +2,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -87,16 +88,6 @@ SGL_DEVICE void naive_transform(
       raw_indices[tx] = -1;
     }
   }
-}
-
-// Warp-inclusive prefix sum (all 32 lanes participate).
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t v) {
-#pragma unroll
-  for (uint32_t d = 1; d < 32; d <<= 1) {
-    const uint32_t n = __shfl_up_sync(0xffffffffu, v, d);
-    if ((threadIdx.x & 31) >= d) v += n;
-  }
-  return v;
 }
 
 [[maybe_unused]]
@@ -292,12 +283,12 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
             const uint32_t w = wb + tx;
             const uint32_t word = w < nwords ? bitmap[w] : 0u;
             const uint32_t cnt = __popc(word);
-            const uint32_t incl = warp_inclusive_sum(cnt);
+            const uint32_t incl = device::warp::inclusive_sum(cnt, lane);
             if (lane == 31) s_warp_incl[warp] = incl;
             __syncthreads();
             if (warp == 0) {
               const uint32_t v = s_warp_incl[lane];
-              const uint32_t vi = warp_inclusive_sum(v);
+              const uint32_t vi = device::warp::inclusive_sum(v, lane);
               s_warp_excl[lane] = vi - v;
             }
             __syncthreads();
