@@ -3915,7 +3915,6 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
-        verify_merge = self._running_batch_can_verify_merge(running_batch)
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -3925,7 +3924,7 @@ class Scheduler(
             self.max_prefill_tokens,
             chunked_prefill_size,
             (
-                running_bs * (self.mixed_tokens_per_running_row if verify_merge else 1)
+                running_bs * self.mixed_tokens_per_running_row
                 if self.is_mixed_chunk
                 else 0
             ),
@@ -4151,13 +4150,12 @@ class Scheduler(
             # Beam member rows are not supported inside a mixed extend batch.
             and all(r.beam_group is None for r in running_batch.reqs)
             # Grammar masks and custom logit processors are not applied inside
-            # a verify-merged mixed step; its budget was charged by verify_merge.
+            # a verify-merged mixed step.
             and not (
                 self.verify_merged_mixed
-                and (
-                    not verify_merge
-                    or new_batch.has_grammar
-                    or new_batch.sampling_info.has_custom_logit_processor
+                and any(
+                    b.has_grammar or b.sampling_info.has_custom_logit_processor
+                    for b in (new_batch, running_batch)
                 )
             )
         ):
@@ -4191,17 +4189,6 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
-
-    def _running_batch_can_verify_merge(self, running_batch: ScheduleBatch) -> bool:
-        """Whether the running rows can take a verify-merged mixed step."""
-        return (
-            self.verify_merged_mixed
-            and not running_batch.is_empty()
-            and not running_batch.return_logprob
-            and not running_batch.has_grammar
-            and not running_batch.sampling_info.has_custom_logit_processor
-            and all(r.beam_group is None for r in running_batch.reqs)
-        )
 
     def can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
