@@ -4855,7 +4855,9 @@ class Scheduler(
     ) -> None:
         mode = batch.forward_mode
         # A verify-merged mixed step is timed as a decode step.
-        is_mixed_spec = mode.is_mixed() and batch.num_prefill_rows is not None
+        is_mixed_spec = (
+            getattr(batch, "num_prefill_rows", None) is not None and mode.is_mixed()
+        )
         is_prefill = mode.is_extend_without_speculative() and not is_mixed_spec
         if not (
             is_prefill or is_mixed_spec or mode.is_decode() or mode.is_target_verify()
