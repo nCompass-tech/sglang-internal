@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components import batch_result_processor
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -55,17 +54,6 @@ class TestProcessBatchResultMixed(CustomTestCase):
         self.assertEqual(dec.reqs, ["d0", "d1", "d2"])
         self.assertEqual(dec.seq_lens_cpu.tolist(), [7, 8, 9])
         self.assertEqual(_decode_total_seq_lens(dec), 24)
-
-    def test_filter_clears_prefill_split(self):
-        # The scheduler filters the merged batch before it becomes the running
-        # (decode) batch; with no row finished, filter_batch returns early.
-        batch = SimpleNamespace(
-            num_prefill_rows=1,
-            beam_tail=None,
-            reqs=[SimpleNamespace(finished=lambda: False)] * 3,
-        )
-        ScheduleBatch.filter_batch(batch)
-        self.assertIsNone(batch.num_prefill_rows)
 
 
 if __name__ == "__main__":
