@@ -57,11 +57,12 @@ H, D, TOPK, C4PAGE = 64, 128, 512, 64
 ROWS_PRE, N_VER, VER_ROWS, PADDED = 3840, 20, 6, 4096
 
 
-def build_case(g, contexts, ver_contexts):
+def build_case(g, contexts, ver_contexts, ext=None):
     """Cache buf, per-row page table [PADDED, max_pages] and c4 lens [PADDED]."""
-    n_seq = len(contexts)
-    ext = [ROWS_PRE // n_seq] * n_seq
-    ext[-1] += ROWS_PRE - sum(ext)
+    if ext is None:
+        n_seq = len(contexts)
+        ext = [ROWS_PRE // n_seq] * n_seq
+        ext[-1] += ROWS_PRE - sum(ext)
     seqs = list(zip(contexts, ext)) + [(c, VER_ROWS) for c in ver_contexts]
     pages_per = [(c // 4 + C4PAGE - 1) // C4PAGE for c, _ in seqs]
     max_pages = max(pages_per)
@@ -233,9 +234,9 @@ def random_verify_contexts(g):
         "uniform_70k_x1",
     ],
 )
-def test_ragged_matches_paged(contexts):
+def test_ragged_matches_paged(contexts, ext=None):
     g = torch.Generator().manual_seed(7)
-    case = build_case(g, contexts, random_verify_contexts(g))
+    case = build_case(g, contexts, random_verify_contexts(g), ext)
     real, mixed_t = case["real"], case["mixed_t"]
     plan = ragged_plan(case)
     assert plan.ragged is not None and plan.ragged.query_rows == mixed_t
@@ -250,6 +251,11 @@ def test_ragged_matches_paged(contexts):
     mismatch, nan = logits_rows_mismatch(lp, lr, plan.lens)
     assert mismatch == 0 and nan == 0, (mismatch, nan)
     assert topk_rows_differ(out_p, out_r, real) == 0
+
+
+def test_short_prefills_keep_later_rows_ragged():
+    # 1-3 token prefills (no C4 entries) first and in the middle of the batch.
+    test_ragged_matches_paged([3, 8192, 1, 30720], ext=[3, 1920, 1, 1916])
 
 
 def test_ragged_row_chunks_match_single_launch(monkeypatch):

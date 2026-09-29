@@ -528,12 +528,17 @@ def build_ragged_indexer_plan(
         # an arbitrary seq_len.
         c4_len = min(int(seq_len) // 4, max_c4_seq_len)
         end = covered + int(extend_len)
-        if c4_len <= 0 or end > num_prefill_rows:
+        if end > num_prefill_rows:
             break  # keep the ragged rows a prefix; the rest goes paged
         seq_rows.append((covered, end))
         seq_c4.append(c4_len)
         covered = end
 
+    # A sequence shorter than 4 tokens has no C4 entries: its rows get an empty
+    # range and it is left out of the K gather.
+    gathered = [(s, c4_len) for (s, _), c4_len in zip(seq_rows, seq_c4) if c4_len]
+    if not gathered:
+        covered = 0
     ragged = lens = None
     topk_plans = []
     if covered:
@@ -561,10 +566,12 @@ def build_ragged_indexer_plan(
                 ),
             )
         ragged = NonPagedIndexerPlan(
-            page_table=page_table[[start for start, _ in seq_rows]]
+            page_table=page_table[[start for start, _ in gathered]]
             .to(torch.int32)
             .contiguous(),
-            gather_seq_lens=seq_c4_cpu.to(device),
+            gather_seq_lens=torch.tensor(
+                [c4_len for _, c4_len in gathered], dtype=torch.int32, device=device
+            ),
             ks=ks,
             ke=ke,
             seq_len_sum=sum(seq_c4),
