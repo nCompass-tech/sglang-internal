@@ -129,6 +129,7 @@ def verify_merged_mixed_enabled(server_args: Any) -> bool:
             ("mixed chunk disabled", not cfg.enable_mixed_chunk),
             ("DP attention", cfg.enable_dp_attention),
             ("pipeline parallelism", cfg.pp_size > 1),
+            ("context parallelism", cfg.attn_cp_size > 1),
             ("decoder SWA bounded replay", cfg.enable_decoder_swa_bounded_replay),
             ("two-batch overlap", cfg.enable_two_batch_overlap),
         )

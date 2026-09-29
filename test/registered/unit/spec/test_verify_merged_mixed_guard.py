@@ -1,5 +1,5 @@
 """SGLANG_DSPARK_VERIFY_MERGED_MIXED falls back (warning, no crash) outside
-DSPARK + --enable-mixed-chunk without DP attention / PP."""
+DSPARK + --enable-mixed-chunk without DP attention / PP / CP."""
 
 import sys
 from types import SimpleNamespace
@@ -19,6 +19,7 @@ def _args(**kw):
         enable_mixed_chunk=True,
         enable_dp_attention=False,
         pp_size=1,
+        attn_cp_size=1,
         enable_decoder_swa_bounded_replay=False,
         enable_two_batch_overlap=False,
     )
@@ -35,6 +36,7 @@ def _args(**kw):
         (_args(enable_mixed_chunk=False), "mixed chunk disabled"),
         (_args(enable_dp_attention=True), "DP attention"),
         (_args(pp_size=2), "pipeline parallelism"),
+        (_args(attn_cp_size=2), "context parallelism"),
         (_args(enable_decoder_swa_bounded_replay=True), "decoder SWA bounded replay"),
         (_args(enable_two_batch_overlap=True), "two-batch overlap"),
     ],
