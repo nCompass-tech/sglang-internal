@@ -949,6 +949,8 @@ class SchedulerBatchResultProcessor:
         dec.forward_mode = ForwardMode.DECODE
         dec.decoding_reqs = None
         dec.num_prefill_rows = None
+        if batch.seq_lens_cpu is not None:
+            dec.seq_lens_cpu = batch.seq_lens_cpu[n:]
         r_dec = copy.copy(result)
         r_dec.next_token_ids = result.next_token_ids[n:]
         self.process_batch_result_decode(dec, r_dec)
