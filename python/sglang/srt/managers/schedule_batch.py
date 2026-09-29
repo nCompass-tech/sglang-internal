@@ -3685,6 +3685,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         keep_indices: Optional[List[int]] = None,
     ):
         strip_beam_tail(self)
+        # Filtering ends a verify-merged mixed step; its row split is stale.
+        self.num_prefill_rows = None
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
